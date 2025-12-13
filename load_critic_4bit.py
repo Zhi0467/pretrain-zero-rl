@@ -5,7 +5,7 @@ No Accelerate, no HuggingFace, just clean PyTorch + BitsAndBytes
 
 import torch
 import torch.nn as nn
-from model import GPTConfig, GPT
+from models.gpt2 import GPTConfig, GPT
 
 def quantize_linear_layer_4bit(linear_layer):
     """

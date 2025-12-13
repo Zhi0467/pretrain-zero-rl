@@ -19,7 +19,7 @@ import pickle
 import numpy as np
 import torch
 from contextlib import nullcontext
-from model import GPTConfig, GPT
+from models.gpt2 import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
 # Configuration - can be overridden from command line or config file

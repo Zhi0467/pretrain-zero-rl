@@ -6,7 +6,7 @@ import time
 # -----------------------------------------------------------------------------
 # I/O
 out_dir = "out"  # Changed to be inside /root/out Modal volume mount
-experiment_name = "avatarl_pretrain_250M_adamw_big_critic"
+experiment_name = "pretrain_critic_qwen3_0.6b_base"
 
 # Evaluation and logging intervals
 # Can specify as iterations (int) or epochs (float with 'e' suffix in string, e.g., "0.5e" for every half epoch)
@@ -19,7 +19,7 @@ init_from = "scratch"
 
 # wandb logging
 wandb_log = True
-wandb_project = "nanogpt-avatarl"
+wandb_project = "pretrain-zero-rl"
 wandb_run_name = "run_" + str(time.time())
 
 # data
@@ -77,7 +77,7 @@ bench = False  # Whether we're benchmarking - calculates MFU on each iteration
 # AvataRL specific parameters
 # -----------------------------------------------------------------------------
 critic_model_path = 'out/ckpt_wandb_logging_fix.pt' # Path to the pre-trained critic model
-use_4bit_critic = True  # Whether to load critic model with 4-bit quantization (saves ~75% memory)
+use_4bit_critic = False  # Whether to load critic model with 4-bit quantization (saves ~75% memory)
 
 # PoE weights
 reality_weight = 0.7

@@ -28,7 +28,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 import torch.distributed as dist
 
-from model import GPTConfig, GPT
+from models.gpt2 import GPTConfig, GPT
 
 # Whether to do a https://github.dev/KellerJordan/modded-nanogpt style speedrun test.
 speedrun = os.environ.get("NANOGPT_SPEEDRUN", "false").lower() in ("true", "1")

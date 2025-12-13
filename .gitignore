@@ -214,3 +214,7 @@ wandb/
 # Documentation and issues (keep locally but not in remote)
 docs/
 issues/
+
+.venv/
+uv.lock
+.env

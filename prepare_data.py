@@ -33,17 +33,47 @@ def download_file(url: str, fname: str, chunk_size: int = 1024):
                 size = file.write(data)
                 bar.update(size)
 
-def prepare_shakespeare():
+def _get_tokenizer(tokenizer_name: str):
+    """
+    Return an encode callable, eos token id, and vocab size for the requested tokenizer.
+    Supported: 'gpt2' (default), 'qwen3'.
+    """
+    tokenizer_name = tokenizer_name.lower()
+
+    if tokenizer_name == "gpt2":
+        import tiktoken
+
+        enc = tiktoken.get_encoding("gpt2")
+        return enc.encode_ordinary, enc.eot_token, enc.n_vocab
+
+    if tokenizer_name == "qwen3":
+        from models.qwen_tokenizer import Qwen3Tokenizer
+
+        repo_id = os.environ.get("QWEN3_TOKENIZER_REPO", "Qwen/Qwen3-0.6B-Base")
+        tok_file = os.environ.get("QWEN3_TOKENIZER_FILE", "tokenizer-qwen3.json")
+        qwen_tok = Qwen3Tokenizer(
+            tokenizer_file_path=tok_file,
+            repo_id=repo_id,
+            apply_chat_template=False,
+            add_generation_prompt=False,
+            add_thinking=False,
+        )
+        # Tokenizers Tokenizer exposes vocab size
+        vocab_size = qwen_tok._tok.get_vocab_size()  # noqa: SLF001
+
+        def encode_fn(text: str):
+            return qwen_tok.encode(text, chat_wrapped=False)
+
+        return encode_fn, qwen_tok.eos_token_id, vocab_size
+
+    raise ValueError(f"Unsupported tokenizer '{tokenizer_name}'. Use 'gpt2' or 'qwen3'.")
+
+
+def prepare_shakespeare(tokenizer: str = "gpt2"):
     """
     Prepare the tiny shakespeare dataset.
     Uses GPT-2 BPE tokenizer.
     """
-    try:
-        import tiktoken
-    except ImportError:
-        print("Please install tiktoken: pip install tiktoken")
-        return
-    
     data_dir = Path("data/shakespeare")
     data_dir.mkdir(parents=True, exist_ok=True)
     
@@ -58,16 +88,19 @@ def prepare_shakespeare():
         data = f.read()
     print(f"Length of dataset in characters: {len(data):,}")
     
-    # Use GPT-2 tokenizer
-    enc = tiktoken.get_encoding("gpt2")
-    train_ids = enc.encode_ordinary(data)
+    encode_fn, eos_token, vocab_size = _get_tokenizer(tokenizer)
+    train_ids = encode_fn(data)
+    if eos_token is not None:
+        train_ids.append(eos_token)
     print(f"Total tokens: {len(train_ids):,}")
-    print(f"Vocab size: {enc.n_vocab}")
+    print(f"Vocab size: {vocab_size}")
+    print(f"Vocab size: {vocab_size}")
     
     # Split into train and val (90/10)
     n = len(train_ids)
-    train_data = np.array(train_ids[:int(n*0.9)], dtype=np.uint16)
-    val_data = np.array(train_ids[int(n*0.9):], dtype=np.uint16)
+    token_dtype = np.uint32 if vocab_size > np.iinfo(np.uint16).max else np.uint16
+    train_data = np.array(train_ids[:int(n*0.9)], dtype=token_dtype)
+    val_data = np.array(train_ids[int(n*0.9):], dtype=token_dtype)
     
     # Save to binary files
     train_data.tofile(data_dir / "train.bin")
@@ -79,17 +112,16 @@ def prepare_shakespeare():
     print(f"Val tokens: {len(val_data):,}")
     print(f"Files saved to {data_dir}")
 
-def prepare_openwebtext():
+def prepare_openwebtext(tokenizer: str = "gpt2"):
     """
     Prepare OpenWebText dataset using HuggingFace datasets.
     Uses GPT-2 BPE tokenizer.
     """
     try:
-        import tiktoken
         from datasets import load_dataset
     except ImportError:
         print("Please install required packages:")
-        print("pip install tiktoken datasets")
+        print("pip install tiktoken datasets tokenizers")
         return
     
     data_dir = Path("data/openwebtext")
@@ -109,12 +141,12 @@ def prepare_openwebtext():
     )
     split_dataset["val"] = split_dataset.pop("test")
     
-    # Use GPT-2 tokenizer
-    enc = tiktoken.get_encoding("gpt2")
+    encode_fn, eos_token, vocab_size = _get_tokenizer(tokenizer)
     
     def process(example):
-        ids = enc.encode_ordinary(example["text"])
-        ids.append(enc.eot_token)
+        ids = encode_fn(example["text"])
+        if eos_token is not None:
+            ids.append(eos_token)
         return {"ids": ids, "len": len(ids)}
     
     # Tokenize datasets
@@ -126,14 +158,15 @@ def prepare_openwebtext():
         num_proc=num_proc,
     )
     
+    token_dtype = np.uint32 if vocab_size > np.iinfo(np.uint16).max else np.uint16
+
     # Concatenate all ids
     for split, dset in tokenized.items():
         arr_len = np.sum(dset["len"], dtype=np.uint64)
         
         # Create output array
         filename = data_dir / f"{split}.bin"
-        dtype = np.uint16
-        arr = np.memmap(filename, dtype=dtype, mode="w+", shape=(arr_len,))
+        arr = np.memmap(filename, dtype=token_dtype, mode="w+", shape=(arr_len,))
         total_batches = 1024
         
         idx = 0
@@ -149,15 +182,15 @@ def prepare_openwebtext():
     print(f"Saved train.bin and val.bin to {data_dir}")
     print(f"Train tokens: {tokenized['train']['len'].sum():,}")
     print(f"Val tokens: {tokenized['val']['len'].sum():,}")
+    print(f"Tokenizer: {tokenizer} | Vocab size: {vocab_size}")
 
-def prepare_custom(data_path: str):
+def prepare_custom(data_path: str, tokenizer: str = "gpt2"):
     """
     Prepare a custom text dataset using GPT-2 tokenizer.
     
     Args:
         data_path: Path to a text file or directory of text files
     """
-    import tiktoken
     from pathlib import Path
     
     data_path = Path(data_path)
@@ -181,13 +214,14 @@ def prepare_custom(data_path: str):
     data_dir = Path(f"data/{dataset_name}")
     data_dir.mkdir(parents=True, exist_ok=True)
     
-    # Use GPT-2 tokenization
-    enc = tiktoken.get_encoding("gpt2")
-    tokens = enc.encode_ordinary(text)
-    vocab_size = enc.n_vocab
+    encode_fn, eos_token, vocab_size = _get_tokenizer(tokenizer)
+    tokens = encode_fn(text)
+    if eos_token is not None:
+        tokens.append(eos_token)
     
-    # Convert to numpy array
-    tokens = np.array(tokens, dtype=np.uint16)
+    # Convert to numpy array (Qwen3 vocab doesn't fit in uint16)
+    token_dtype = np.uint32 if vocab_size > np.iinfo(np.uint16).max else np.uint16
+    tokens = np.array(tokens, dtype=token_dtype)
     
     # Split 90/10
     n = len(tokens)
@@ -275,15 +309,22 @@ if __name__ == "__main__":
         default="shakespeare",
         help="Which dataset to prepare: 'shakespeare', 'openwebtext', or path to custom text file/directory",
     )
+    parser.add_argument(
+        "--tokenizer",
+        type=str,
+        default="gpt2",
+        choices=["gpt2", "qwen3"],
+        help="Tokenizer to use for preparation",
+    )
     
     args = parser.parse_args()
     
     if args.dataset == "shakespeare":
-        prepare_shakespeare()
+        prepare_shakespeare(tokenizer=args.tokenizer)
     elif args.dataset == "openwebtext":
-        prepare_openwebtext()
+        prepare_openwebtext(tokenizer=args.tokenizer)
     else:
-        prepare_custom(args.dataset)
+        prepare_custom(args.dataset, tokenizer=args.tokenizer)
     
     print("\nTo use this data with Modal, run:")
     print(f"  modal run prepare_data.py::prepare_data_modal --dataset {args.dataset}")

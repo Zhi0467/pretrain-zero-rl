@@ -28,10 +28,23 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 import torch.distributed as dist
 
-from model import GPTConfig, GPT
+from models.gpt2 import GPTConfig, GPT
+from load_critic_hf import load_critic_model_hf
+from models.qwen3 import Qwen3Model, QWEN_CONFIG_06_B
 
 # Import all configuration variables
 from config.train_avatarl import *
+# load wandb api key, project, and entity from .env
+from dotenv import load_dotenv
+from pathlib import Path
+import wandb
+# load .env from root directory
+load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env")
+wandb_api_key = os.environ.get("WANDB_API_KEY")
+wandb_project = os.environ.get("WANDB_PROJECT")
+if not wandb_api_key or not wandb_project:
+    raise ValueError("WANDB_API_KEY and WANDB_PROJECT must be set")
+wandb.login(key=wandb_api_key)
 
 # -----------------------------------------------------------------------------
 # Create config dictionary for logging
@@ -48,59 +61,111 @@ config = {k: globals()[k] for k in config_keys}  # will be useful for logging
 # AvataRL helper functions
 # -----------------------------------------------------------------------------
 
+def _get_tokenizer_name() -> str:
+    # start.sh exports TOKENIZER; default to gpt2 for backward compatibility
+    return os.environ.get("TOKENIZER", "gpt2").lower()
+
+
+def _get_vocab_size_for_tokenizer(tokenizer_name: str) -> int:
+    if tokenizer_name == "qwen3":
+        return int(QWEN_CONFIG_06_B["vocab_size"])
+    return 50304  # GPT-2 vocab_size, padded for efficiency
+
+
+def _get_bin_dtype_for_vocab_size(vocab_size: int):
+    # Qwen3 vocab doesn't fit in uint16
+    return np.uint32 if vocab_size > np.iinfo(np.uint16).max else np.uint16
+
+
+def _configure_optimizers_generic(model, weight_decay, learning_rate, betas, device_type):
+    """
+    Generic AdamW optimizer configuration (GPT-style):
+    - Apply weight decay to 2D+ parameters; none to biases/norms (1D)
+    """
+    # start with all of the candidate parameters
+    param_dict = {pn: p for pn, p in model.named_parameters()}
+    # filter out those that do not require grad
+    param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+
+    decay_params = [p for _, p in param_dict.items() if p.dim() >= 2]
+    nodecay_params = [p for _, p in param_dict.items() if p.dim() < 2]
+    optim_groups = [
+        {"params": decay_params, "weight_decay": weight_decay},
+        {"params": nodecay_params, "weight_decay": 0.0},
+    ]
+
+    fused_available = "fused" in torch.optim.AdamW.__init__.__code__.co_varnames
+    use_fused = fused_available and device_type == "cuda"
+    extra_args = dict(fused=True) if use_fused else dict()
+    optimizer = torch.optim.AdamW(
+        optim_groups, lr=learning_rate, betas=betas, **extra_args
+    )
+    print(f"using fused AdamW: {use_fused}")
+    return optimizer
+
+
 
 def load_critic_model(checkpoint_path: str):
     """
-    Load a pre-trained critic model from checkpoint, optionally with 4-bit quantization.
-    
-    Args:
-        checkpoint_path: Path to the critic model checkpoint
-        
-    Returns:
-        critic_model: Loaded critic model in eval mode on CUDA (4-bit or FP16 based on config)
+    Load a pre-trained critic model.
+    Supports:
+      - Local GPT-based checkpoints (FP16 or 4-bit)
+      - HF models via CRITIC_HF_MODEL env or `hf:` prefix on checkpoint_path
     """
-    # Check if we should use 4-bit quantization (from config)
-    if use_4bit_critic:
-        # Import our 4-bit loading function
-        from load_critic_4bit import load_critic_model_4bit
-        
-        print(f"Loading critic with 4-bit quantization for ~75% memory reduction")
-        return load_critic_model_4bit(checkpoint_path)
-    else:
-        # Original FP16 loading path
-        print(f"Loading critic model in FP16 from {checkpoint_path}")
-        
-        # Load checkpoint - extract only what we need
-        checkpoint = torch.load(checkpoint_path, map_location='cuda')
-        checkpoint_model_args = checkpoint["model_args"]
-        state_dict = checkpoint["model"]
-        
-        # Free the checkpoint dict immediately - we don't need optimizer states!
-        del checkpoint
-        torch.cuda.empty_cache()
-        
-        # Create model with checkpoint config
-        gptconf = GPTConfig(**checkpoint_model_args)
-        critic_model = GPT(gptconf)
-        
-        # Remove unwanted prefix if present
-        unwanted_prefix = "_orig_mod."
-        for k, v in list(state_dict.items()):
-            if k.startswith(unwanted_prefix):
-                state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-        
-        critic_model.load_state_dict(state_dict)
-        critic_model.cuda()
-        critic_model.eval()  # Set to eval mode
-        
-        # Disable gradients for critic
+    # env overrides
+    env_hf_model = os.environ.get("CRITIC_HF_MODEL")
+    env_use_4bit = os.environ.get("USE_4BIT_CRITIC")
+    effective_use_4bit = use_4bit_critic if env_use_4bit is None else env_use_4bit.lower() in {"1", "true", "yes"}
+
+    # HF path support
+    if env_hf_model or checkpoint_path.startswith("hf:"):
+        hf_model_id = env_hf_model or checkpoint_path[len("hf:"):]
+        print(f"Loading critic from HuggingFace: {hf_model_id}")
+        critic_model = load_critic_model_hf(hf_model_id)
+        critic_model.eval()
         for param in critic_model.parameters():
             param.requires_grad = False
-        
-        print(f"Critic loaded in FP16 - {checkpoint_model_args['n_layer']} layers, {checkpoint_model_args['n_embd']} dim")
-        print(f"Memory usage: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
-        
         return critic_model
+
+    # Check if we should use 4-bit quantization (from config or env)
+    if effective_use_4bit:
+        from load_critic_4bit import load_critic_model_4bit
+        print(f"Loading critic with 4-bit quantization for ~75% memory reduction")
+        return load_critic_model_4bit(checkpoint_path)
+
+    # Original FP16 path
+    print(f"Loading critic model in FP16 from {checkpoint_path}")
+
+    checkpoint = torch.load(checkpoint_path, map_location='cuda')
+    checkpoint_model_args = checkpoint["model_args"]
+    state_dict = checkpoint["model"]
+
+    # Free the checkpoint dict immediately - we don't need optimizer states!
+    del checkpoint
+    torch.cuda.empty_cache()
+
+    # Create model with checkpoint config
+    gptconf = GPTConfig(**checkpoint_model_args)
+    critic_model = GPT(gptconf)
+
+    # Remove unwanted prefix if present
+    unwanted_prefix = "_orig_mod."
+    for k, v in list(state_dict.items()):
+        if k.startswith(unwanted_prefix):
+            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+
+    critic_model.load_state_dict(state_dict)
+    critic_model.cuda()
+    critic_model.eval()  # Set to eval mode
+
+    # Disable gradients for critic
+    for param in critic_model.parameters():
+        param.requires_grad = False
+
+    print(f"Critic loaded in FP16 - {checkpoint_model_args['n_layer']} layers, {checkpoint_model_args['n_embd']} dim")
+    print(f"Memory usage: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
+
+    return critic_model
 
 
 def compute_avatarl_loss(
@@ -591,9 +656,9 @@ def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
     if split == "train":
-        data = np.memmap(os.path.join(data_dir, "train.bin"), dtype=np.uint16, mode="r")
+        data = np.memmap(os.path.join(data_dir, "train.bin"), dtype=bin_dtype, mode="r")
     else:
-        data = np.memmap(os.path.join(data_dir, "val.bin"), dtype=np.uint16, mode="r")
+        data = np.memmap(os.path.join(data_dir, "val.bin"), dtype=bin_dtype, mode="r")
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack(
         [torch.from_numpy((data[i : i + block_size]).astype(np.int64)) for i in ix]
@@ -621,75 +686,81 @@ best_val_loss = 1e9
 current_epoch = 0  # Initialize epoch counter
 
 # Always use GPT-2 vocab size
-print("Using GPT-2 vocab_size of 50304 (50257 rounded up for efficiency)")
+tokenizer_name = _get_tokenizer_name()
+vocab_size = _get_vocab_size_for_tokenizer(tokenizer_name)
+bin_dtype = _get_bin_dtype_for_vocab_size(vocab_size)
+print(f"Tokenizer: {tokenizer_name} | vocab_size={vocab_size} | bin_dtype={bin_dtype}")
 
 # model init
-model_args = dict(
-    n_layer=n_layer,
-    n_head=n_head,
-    n_embd=n_embd,
-    block_size=block_size,
-    bias=bias,
-    vocab_size=50304,  # GPT-2 vocab_size, padded for efficiency
-    dropout=dropout,
-)  # start with model_args from command line
-if init_from == "scratch":
-    # init a new model from scratch
-    print("Initializing a new model from scratch")
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
-elif init_from == "resume":
-    print(f"Resuming training from {out_dir}")
-    # resume training from a checkpoint.
-    # Try to find checkpoint with experiment name first, then fall back to default
-    checkpoint_filename = "ckpt.pt" if not experiment_name else f"ckpt_{experiment_name}.pt"
-    ckpt_path = os.path.join(out_dir, checkpoint_filename)
-    
-    # If experiment-specific checkpoint doesn't exist, try default
-    if not os.path.exists(ckpt_path) and experiment_name:
-        default_ckpt_path = os.path.join(out_dir, "ckpt.pt")
-        if os.path.exists(default_ckpt_path):
-            print(f"Experiment checkpoint '{checkpoint_filename}' not found, using default 'ckpt.pt'")
-            ckpt_path = default_ckpt_path
-    
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    checkpoint_model_args = checkpoint["model_args"]
-    # force these config attributes to be equal otherwise we can't even resume training
-    # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in ["n_layer", "n_head", "n_embd", "block_size", "bias", "vocab_size"]:
-        model_args[k] = checkpoint_model_args[k]
-    # create the model
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
-    state_dict = checkpoint["model"]
-    # fix the keys of the state dictionary :(
-    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
-    unwanted_prefix = "_orig_mod."
-    for k, v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix) :]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
-    iter_num = checkpoint["iter_num"]
-    best_val_loss = checkpoint["best_val_loss"]
-    # Restore epoch if present in checkpoint (backward compatibility)
-    if "current_epoch" in checkpoint:
-        current_epoch = checkpoint["current_epoch"]
-    else:
-        current_epoch = 0
-elif init_from.startswith("gpt2"):
-    print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
-    # initialize from OpenAI GPT-2 weights
-    override_args = dict(dropout=dropout)
-    model = GPT.from_pretrained(init_from, override_args)
-    # read off the created config params, so we can store them into checkpoint correctly
-    for k in ["n_layer", "n_head", "n_embd", "block_size", "bias", "vocab_size"]:
-        model_args[k] = getattr(model.config, k)
-# crop down the model block size if desired, using model surgery
-if block_size < model.config.block_size:
-    model.crop_block_size(block_size)
-    model_args["block_size"] = (
-        block_size  # so that the checkpoint will have the right value
+if tokenizer_name == "qwen3":
+    if init_from != "scratch":
+        raise ValueError("Qwen3 student currently supports init_from='scratch' only")
+
+    print("Initializing Qwen3 student model from scratch")
+    # Use the canonical Qwen3-0.6B config as the architecture source-of-truth.
+    # Only override runtime knobs that must match our training setup.
+    qwen_cfg = dict(QWEN_CONFIG_06_B)
+    qwen_cfg["context_length"] = block_size
+    qwen_cfg["dtype"] = ptdtype
+    # vocab_size should already match QWEN_CONFIG_06_B; keep it explicit to avoid drift
+    qwen_cfg["vocab_size"] = vocab_size
+    model_args = dict(model_type="qwen3", **qwen_cfg)
+    model = Qwen3Model(qwen_cfg)
+else:
+    print("Initializing GPT student model")
+    model_args = dict(
+        n_layer=n_layer,
+        n_head=n_head,
+        n_embd=n_embd,
+        block_size=block_size,
+        bias=bias,
+        vocab_size=vocab_size,
+        dropout=dropout,
     )
+    if init_from == "scratch":
+        print("Initializing a new model from scratch")
+        gptconf = GPTConfig(**model_args)
+        model = GPT(gptconf)
+    elif init_from == "resume":
+        print(f"Resuming training from {out_dir}")
+        checkpoint_filename = "ckpt.pt" if not experiment_name else f"ckpt_{experiment_name}.pt"
+        ckpt_path = os.path.join(out_dir, checkpoint_filename)
+
+        if not os.path.exists(ckpt_path) and experiment_name:
+            default_ckpt_path = os.path.join(out_dir, "ckpt.pt")
+            if os.path.exists(default_ckpt_path):
+                print(f"Experiment checkpoint '{checkpoint_filename}' not found, using default 'ckpt.pt'")
+                ckpt_path = default_ckpt_path
+
+        checkpoint = torch.load(ckpt_path, map_location=device)
+        checkpoint_model_args = checkpoint["model_args"]
+        for k in ["n_layer", "n_head", "n_embd", "block_size", "bias", "vocab_size"]:
+            model_args[k] = checkpoint_model_args[k]
+        gptconf = GPTConfig(**model_args)
+        model = GPT(gptconf)
+        state_dict = checkpoint["model"]
+        unwanted_prefix = "_orig_mod."
+        for k, v in list(state_dict.items()):
+            if k.startswith(unwanted_prefix):
+                state_dict[k[len(unwanted_prefix) :]] = state_dict.pop(k)
+        model.load_state_dict(state_dict)
+        iter_num = checkpoint["iter_num"]
+        best_val_loss = checkpoint["best_val_loss"]
+        if "current_epoch" in checkpoint:
+            current_epoch = checkpoint["current_epoch"]
+        else:
+            current_epoch = 0
+    elif init_from.startswith("gpt2"):
+        print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
+        override_args = dict(dropout=dropout)
+        model = GPT.from_pretrained(init_from, override_args)
+        for k in ["n_layer", "n_head", "n_embd", "block_size", "bias", "vocab_size"]:
+            model_args[k] = getattr(model.config, k)
+
+    if block_size < model.config.block_size:
+        model.crop_block_size(block_size)
+        model_args["block_size"] = block_size
+
 model.to(device)
 
 # Load critic model for AvataRL
@@ -701,6 +772,8 @@ scaler = torch.amp.GradScaler("cuda", enabled=(dtype == "float16"))
 
 # optimizer
 if use_dual_optimizer:
+    if tokenizer_name == "qwen3":
+        raise ValueError("use_dual_optimizer is currently GPT-specific; disable it for Qwen3 student runs.")
     # Dual optimizer setup (Muon + Adam)
     # Collect parameters and group them
     hidden_matrix_params = [
@@ -750,9 +823,14 @@ if use_dual_optimizer:
             optimizer1.load_state_dict(checkpoint["optimizer"])
 else:
     # Original single optimizer setup
-    optimizer = model.configure_optimizers(
-        weight_decay, learning_rate, (beta1, beta2), device_type
-    )
+    if hasattr(model, "configure_optimizers"):
+        optimizer = model.configure_optimizers(
+            weight_decay, learning_rate, (beta1, beta2), device_type
+        )
+    else:
+        optimizer = _configure_optimizers_generic(
+            model, weight_decay, learning_rate, (beta1, beta2), device_type
+        )
     optimizers = [optimizer]  # Wrap in list for consistency
     
     # Store initial learning rate
@@ -1077,13 +1155,14 @@ with profiler:
                 # This reflects actual compute: critic forward + loss computation overhead
                 # NOT top_k forward passes (which don't happen)
                 
-                mfu = raw_model.estimate_mfu(
-                    batch_size * gradient_accumulation_steps * avatarl_multiplier, dt
-                )
-                running_mfu = (
-                    mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
-                )
-                out_str += f", mfu {running_mfu * 100:.2f}%"
+                if hasattr(raw_model, "estimate_mfu"):
+                    mfu = raw_model.estimate_mfu(
+                        batch_size * gradient_accumulation_steps * avatarl_multiplier, dt
+                    )
+                    running_mfu = (
+                        mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
+                    )
+                    out_str += f", mfu {running_mfu * 100:.2f}%"
 
             print(out_str)
 
