@@ -468,11 +468,27 @@ val_data_size = None
 iter_num = 0
 best_val_loss = 1e9
 current_epoch = 0  # Initialize epoch counter
+resume_run = init_from == "resume"
+resume_wall_time = 0.0
+wandb_run_id = None
 
 tokenizer_name = _get_tokenizer_name()
 vocab_size = _get_vocab_size_for_tokenizer(tokenizer_name)
 bin_dtype = _get_bin_dtype_for_vocab_size(vocab_size)
 print(f"Tokenizer: {tokenizer_name} | vocab_size={vocab_size} | bin_dtype={bin_dtype}")
+
+
+_memmap_cache: dict[str, np.memmap] = {}
+
+
+def _get_memmap(split: str) -> np.memmap:
+    """Return (and cache) the memmap for a dataset split."""
+    if split not in _memmap_cache:
+        filename = os.path.join("data", dataset, f"{split}.bin")
+        if not os.path.exists(filename):
+            raise FileNotFoundError(f"Dataset split '{split}' missing at {filename}")
+        _memmap_cache[split] = np.memmap(filename, dtype=bin_dtype, mode="r")
+    return _memmap_cache[split]
 
 
 def get_dataset_size(split):
@@ -483,7 +499,7 @@ def get_dataset_size(split):
     elif split == "val" and val_data_size is not None:
         return val_data_size
     
-    data = np.memmap(os.path.join(data_dir, f"{split}.bin"), dtype=bin_dtype, mode="r")
+    data = _get_memmap(split)
     size = len(data)
     
     if split == "train":
@@ -534,17 +550,6 @@ if max_iters is None:
         print(f"WARNING: Neither max_iters nor max_epochs specified. Using default max_iters=10000")
         max_iters = 10000
 
-# progress bar (master only; show even if total is unknown)
-progress_bar = None
-if master_process:
-    total_iters = max_iters if max_iters is not None else None
-    progress_bar = tqdm(
-        total=total_iters,
-        initial=0,
-        desc="train",
-        leave=True,
-        dynamic_ncols=True,
-    )
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
@@ -688,19 +693,49 @@ class Muon(torch.optim.Optimizer):
 
 # model init
 if tokenizer_name == "qwen3":
-    if init_from != "scratch":
-        raise ValueError("Qwen3 student currently supports init_from='scratch' only")
+    if init_from == "scratch":
+        print("Initializing Qwen3 student model from scratch")
+        # Use the canonical Qwen3-0.6B config as the architecture source-of-truth.
+        # Only override runtime knobs that must match our training setup.
+        qwen_cfg = dict(QWEN_CONFIG_06_B)
+        qwen_cfg["context_length"] = block_size
+        qwen_cfg["dtype"] = ptdtype
+        # vocab_size should already match QWEN_CONFIG_06_B; keep it explicit to avoid drift
+        qwen_cfg["vocab_size"] = vocab_size
+        model_args = dict(model_type="qwen3", **qwen_cfg)
+        model = Qwen3Model(qwen_cfg)
+    elif init_from == "resume":
+        print(f"Resuming Qwen3 training from {out_dir}")
+        checkpoint_filename = "ckpt.pt" if not experiment_name else f"ckpt_{experiment_name}.pt"
+        ckpt_path = os.path.join(out_dir, checkpoint_filename)
 
-    print("Initializing Qwen3 student model from scratch")
-    # Use the canonical Qwen3-0.6B config as the architecture source-of-truth.
-    # Only override runtime knobs that must match our training setup.
-    qwen_cfg = dict(QWEN_CONFIG_06_B)
-    qwen_cfg["context_length"] = block_size
-    qwen_cfg["dtype"] = ptdtype
-    # vocab_size should already match QWEN_CONFIG_06_B; keep it explicit to avoid drift
-    qwen_cfg["vocab_size"] = vocab_size
-    model_args = dict(model_type="qwen3", **qwen_cfg)
-    model = Qwen3Model(qwen_cfg)
+        if not os.path.exists(ckpt_path) and experiment_name:
+            default_ckpt_path = os.path.join(out_dir, "ckpt.pt")
+            if os.path.exists(default_ckpt_path):
+                print(f"Experiment checkpoint '{checkpoint_filename}' not found, using default 'ckpt.pt'")
+                ckpt_path = default_ckpt_path
+
+        checkpoint = torch.load(ckpt_path, map_location=device)
+        checkpoint_model_args = checkpoint["model_args"]
+        model_args = checkpoint_model_args.copy()
+        model = Qwen3Model(model_args)
+        
+        state_dict = checkpoint["model"]
+        unwanted_prefix = "_orig_mod."
+        for k, v in list(state_dict.items()):
+            if k.startswith(unwanted_prefix):
+                state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+        model.load_state_dict(state_dict)
+        iter_num = checkpoint["iter_num"]
+        best_val_loss = checkpoint["best_val_loss"]
+        wandb_run_id = checkpoint.get("wandb_run_id")
+        resume_wall_time = checkpoint.get("global_wall_time", 0.0)
+        if "current_epoch" in checkpoint:
+            current_epoch = checkpoint["current_epoch"]
+        else:
+            current_epoch = 0
+    else:
+        raise ValueError(f"Qwen3 student only supports init_from='scratch' or 'resume', got '{init_from}'")
 else:
     print("Initializing GPT student model")
     model_args = dict(
@@ -741,6 +776,8 @@ else:
         model.load_state_dict(state_dict)
         iter_num = checkpoint["iter_num"]
         best_val_loss = checkpoint["best_val_loss"]
+        wandb_run_id = checkpoint.get("wandb_run_id")
+        resume_wall_time = checkpoint.get("global_wall_time", 0.0)
         if "current_epoch" in checkpoint:
             current_epoch = checkpoint["current_epoch"]
         else:
@@ -757,6 +794,17 @@ else:
         model_args["block_size"] = block_size
 
 model.to(device)
+
+process_start_wall_time = time.time()
+
+
+def current_global_wall_time() -> float:
+    """Return absolute wall-clock seconds since original run start (persisted via checkpoints)."""
+    return resume_wall_time + (time.time() - process_start_wall_time)
+
+# Track resume metadata for logging/eval alignment
+iter_display_offset = 1 if resume_run else 0
+skip_initial_eval = resume_run
 
 # Load critic model for AvataRL (supports HF via CRITIC_HF_MODEL or hf: prefix)
 critic_source = os.environ.get("CRITIC_HF_MODEL") or critic_model_path
@@ -817,6 +865,7 @@ if use_dual_optimizer:
             print("Warning: Loading single optimizer checkpoint into dual optimizer setup")
             # Only load into the first optimizer as a fallback
             optimizer1.load_state_dict(checkpoint["optimizer"])
+        print(f"Resumed from iteration {iter_num}, best_val_loss={best_val_loss:.4f}")
 else:
     # Original single optimizer setup
     if hasattr(model, "configure_optimizers"):
@@ -835,6 +884,7 @@ else:
     
     if init_from == "resume":
         optimizer.load_state_dict(checkpoint["optimizer"])
+        print(f"Resumed from iteration {iter_num}, best_val_loss={best_val_loss:.4f}")
 
 checkpoint = None  # free up memory
 
@@ -859,12 +909,8 @@ if ddp:
 # poor man's data loader
 
 def get_batch(split):
-    # We recreate np.memmap every batch to avoid a memory leak, as per
-    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
-    if split == "train":
-        data = np.memmap(os.path.join(data_dir, "train.bin"), dtype=bin_dtype, mode="r")
-    else:
-        data = np.memmap(os.path.join(data_dir, "val.bin"), dtype=bin_dtype, mode="r")
+    # Reuse cached memmap to avoid reopening the dataset every batch.
+    data = _get_memmap(split)
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack(
         [torch.from_numpy((data[i : i + block_size]).astype(np.int64)) for i in ix]
@@ -950,7 +996,14 @@ def get_lr(it):
 if wandb_log and master_process:
     import wandb
 
-    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+    resume_kwargs = {}
+    if resume_run and wandb_run_id:
+        resume_kwargs = {"id": wandb_run_id, "resume": "allow"}
+    elif resume_run:
+        print("Warning: resume requested but wandb_run_id missing in checkpoint; starting new W&B run.")
+
+    wandb.init(project=wandb_project, name=wandb_run_name, config=config, **resume_kwargs)
+    wandb_run_id = wandb.run.id if wandb.run else wandb_run_id
 
 wait, warmup, active, repeat = 5, 5, 5, 2
 num_steps = wait + warmup + active
@@ -990,6 +1043,19 @@ profiler = (
 if speedrun and master_process:
     print("Speedrun mode enabled! 🏎️ 🏍️ 🐎 🏃‍♀️")
 
+# progress bar (master only; show even if total is unknown)
+# Note: iter_num is set during model initialization (0 for scratch, loaded value for resume)
+progress_bar = None
+if master_process:
+    total_iters = max_iters if max_iters is not None else None
+    progress_bar = tqdm(
+        total=total_iters,
+        initial=iter_num,  # Start from resumed iteration
+        desc="train",
+        leave=True,
+        dynamic_ncols=True,
+    )
+    
 # training loop
 X, Y = get_batch("train")  # fetch the very first batch
 t0 = time.time()
@@ -1004,6 +1070,7 @@ running_avg_reward = 0.0
 training_time_t0 = time.perf_counter()
 with profiler:
     while True:
+        display_iter = iter_num + iter_display_offset
         # Update epoch counter (use fractional epochs like train.py)
         if iterations_per_epoch is not None and iter_num > 0:
             current_epoch = iter_num / iterations_per_epoch
@@ -1022,7 +1089,14 @@ with profiler:
                 group["momentum"] = (1 - frac) * muon_warmup_start_momentum + frac * muon_warmup_end_momentum
 
         # evaluate the loss on train/val sets and write checkpoints
-        if iter_num % eval_interval == 0 and iter_num > 0 and master_process:
+        should_eval = (
+            eval_interval
+            and iter_num % eval_interval == 0
+            and master_process
+        )
+        if should_eval and skip_initial_eval:
+            skip_initial_eval = False
+        elif should_eval:
             # stop the clock
             torch.cuda.synchronize()
             training_time_ms += 1000 * (time.perf_counter() - training_time_t0)
@@ -1030,7 +1104,7 @@ with profiler:
             losses = estimate_loss()
             epoch_str = f" (epoch {current_epoch:.2f})" if iterations_per_epoch else ""
             print(
-                f"step {iter_num}{epoch_str}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, val_ce_loss {losses['val_ce']:.4f} train_time:{training_time_ms:.0f}ms"
+                f"step {display_iter}{epoch_str}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, val_ce_loss {losses['val_ce']:.4f} train_time:{training_time_ms:.0f}ms"
             )
             if speedrun and losses["val"] < speedrun_target_eval_loss:
                 print(
@@ -1043,12 +1117,13 @@ with profiler:
 
             if wandb_log:
                 log_dict = {
-                    "iter": iter_num,
+                    "iter": display_iter,
                     "train/loss": losses["train"],
                     "val/loss": losses["val"],
                     "val/ce_loss": losses["val_ce"],
                     "lr": lr,
                     "mfu": running_mfu * 100,  # convert to percentage
+                    "global_wall_time": current_global_wall_time(),
                 }
                 if iterations_per_epoch:
                     log_dict["epoch"] = current_epoch
@@ -1058,7 +1133,7 @@ with profiler:
                         "avatarl/avg_reward": running_avg_reward,
                         "avatarl/instant_reward": avatarl_metrics['avg_reward'],
                     })
-                wandb.log(log_dict)
+                wandb.log(log_dict, step=display_iter)
             if (
                 losses["val"] < best_val_loss or always_save_checkpoint
             ) and not speedrun:
@@ -1068,12 +1143,15 @@ with profiler:
                         "model": raw_model.state_dict(),
                         "optimizer": [opt.state_dict() for opt in optimizers] if use_dual_optimizer else optimizers[0].state_dict(),
                         "model_args": model_args,
+                        "model_type": tokenizer_name,  # Save model type (qwen3 or gpt2)
                         "iter_num": iter_num,
                         "best_val_loss": best_val_loss,
                         "config": config,
                         "use_dual_optimizer": use_dual_optimizer,  # Save optimizer type for loading
                         "current_epoch": current_epoch,  # Save epoch information
                         "iterations_per_epoch": iterations_per_epoch,  # Save for consistency checks
+                        "global_wall_time": current_global_wall_time(),
+                        "wandb_run_id": wandb_run_id,
                     }
                     # Construct checkpoint filename with experiment name suffix
                     checkpoint_filename = "ckpt.pt" if not experiment_name else f"ckpt_{experiment_name}.pt"
@@ -1158,7 +1236,7 @@ with profiler:
             lossf = loss.item() * gradient_accumulation_steps
 
             epoch_str = f" (epoch {current_epoch:.2f})" if iterations_per_epoch else ""
-            out_str = f"iter {iter_num}{epoch_str}: loss {lossf:.4f}, ce_loss {top1_ce_loss.item():.4f}, time {dt * 1000:.2f}ms"
+            out_str = f"iter {display_iter}{epoch_str}: loss {lossf:.4f}, ce_loss {top1_ce_loss.item():.4f}, time {dt * 1000:.2f}ms, wall_time {current_global_wall_time():.1f}s"
             
             # Update running averages for AvataRL metrics
             if 'avatarl_metrics' in locals():

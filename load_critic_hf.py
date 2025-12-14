@@ -19,9 +19,16 @@ def load_critic_model_hf(model_id: str, device: str | None = None, dtype=None):
     - Moves to the requested device
     """
     if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        if torch.cuda.is_available():
+            # Respect LOCAL_RANK so each DDP rank loads to its own GPU
+            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+            device = f"cuda:{local_rank}"
+        else:
+            device = "cpu"
     dtype = dtype or _default_dtype()
-    device_map = "auto" if device.startswith("cuda") else {"": device}
+    # Avoid HF tensor-parallel sharding (triggered with device_map="auto" under DDP)
+    # that can try to wrap non-floating shards in Parameters and crash.
+    device_map = {"": device}
 
     print(f"Loading HF critic model '{model_id}' on {device} (dtype={dtype})...")
     model = AutoModelForCausalLM.from_pretrained(

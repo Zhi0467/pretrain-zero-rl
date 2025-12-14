@@ -10,8 +10,8 @@ experiment_name = "pretrain_critic_qwen3_0.6b_base"
 
 # Evaluation and logging intervals
 # Can specify as iterations (int) or epochs (float with 'e' suffix in string, e.g., "0.5e" for every half epoch)
-eval_interval = 1000  # Evaluate every N iterations (or set to "1.0e" for every epoch)
-log_interval = 100  # Log every N iterations
+eval_interval = 500  # Evaluate every N iterations (or set to "1.0e" for every epoch)
+log_interval = 50  # Log every N iterations
 eval_iters = 100
 eval_only = False
 always_save_checkpoint = True

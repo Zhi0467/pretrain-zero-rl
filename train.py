@@ -88,12 +88,13 @@ default_qwen_cfg = QWEN_CONFIG_06_B.copy()
 out_dir = "out"
 experiment_name = "normal_pretrain_qwen3_0.6b_base"  # optional experiment name suffix for checkpoint files
 # every how many steps to evaluate val loss? 0 for only at the end
-eval_interval = 1000 if not speedrun else 125  # 125 is used in modded-nanogpt
-log_interval = 100
+eval_interval = 500 if not speedrun else 125  # 125 is used in modded-nanogpt
+log_interval = 50
 eval_iters = 100
 eval_only = False  # if True, script exits right after the first eval
 always_save_checkpoint = True  # if True, always save a checkpoint after each eval
-init_from = "scratch"  # 'scratch' or 'resume' or 'gpt2*'
+init_from = "resume"  # 'scratch' or 'resume' 
+
 # wandb logging
 wandb_log = True  # disabled by default
 wandb_run_name = "normal_train_run_" + str(time.time())  
@@ -113,7 +114,7 @@ bias = False  # do we use bias inside LayerNorm and Linear layers?
 learning_rate = 6e-4  # max learning rate (10x for better Muon dual optimizer alignment)
 # Training duration - can specify either max_iters OR max_epochs (not both)
 # If max_epochs is set, max_iters will be calculated automatically based on dataset size
-max_iters = 10000  # Maximum training iterations (set to None to use max_epochs instead)
+max_iters = 100  # Maximum training iterations (set to None to use max_epochs instead)
 max_epochs = None  # Maximum training epochs (set to None to use max_iters instead)
 max_tokens = None  # 50_000_000_000 to drive by tokens instead of epochs/iterations
 weight_decay = 1e-1
@@ -198,17 +199,27 @@ print(f"tokens per iteration will be: {tokens_per_iter:,}")
 # Select dataset dtype based on vocab size (Qwen3 uses uint32)
 token_dtype = np.uint32 if vocab_size > np.iinfo(np.uint16).max else np.uint16
 
+# Persistent memmap cache to avoid re-opening dataset files every batch
+_memmap_cache: dict[str, np.memmap] = {}
+
+
+def _get_memmap(split: str) -> np.memmap:
+    """Return (and cache) the memmap for a dataset split."""
+    if split not in _memmap_cache:
+        filename = os.path.join("data", dataset, f"{split}.bin")
+        if not os.path.exists(filename):
+            raise FileNotFoundError(f"Dataset split '{split}' missing at {filename}")
+        _memmap_cache[split] = np.memmap(filename, dtype=token_dtype, mode="r")
+    return _memmap_cache[split]
+
 
 # Calculate epoch information if dataset exists
 data_dir = os.path.join("data", dataset)
 try:
-    if os.path.exists(os.path.join(data_dir, "train.bin")):
-        # Import get_dataset_size function (will be defined later in the file)
-        # For now, read dataset size directly here
-        train_data = np.memmap(os.path.join(data_dir, "train.bin"), dtype=token_dtype, mode="r")
+    train_path = os.path.join(data_dir, "train.bin")
+    if os.path.exists(train_path):
+        train_data = _get_memmap("train")
         train_tokens = len(train_data)
-        del train_data  # Release memmap
-        
         # Number of sequences we can sample from the dataset
         num_sequences = max(0, train_tokens - block_size)
         # Iterations per epoch = sequences / (batch_size * gradient_accumulation_steps * world_size)
@@ -248,17 +259,6 @@ if max_iters is None:
         print(f"WARNING: Neither max_iters nor max_epochs specified. Using default max_iters=10000")
         max_iters = 10000
 
-# progress bar (master only; show even if total is unknown)
-progress_bar = None
-if master_process:
-    total_iters = max_iters if max_iters is not None else None
-    progress_bar = tqdm(
-        total=total_iters,
-        initial=0,
-        desc="train",
-        leave=True,
-        dynamic_ncols=True,
-    )
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
@@ -414,8 +414,8 @@ def get_dataset_size(split):
         return train_data_size
     elif split == "val" and val_data_size is not None:
         return val_data_size
-    
-    data = np.memmap(os.path.join(data_dir, f"{split}.bin"), dtype=token_dtype, mode="r")
+
+    data = _get_memmap(split)
     size = len(data)
     
     if split == "train":
@@ -426,12 +426,8 @@ def get_dataset_size(split):
     return size
 
 def get_batch(split):
-    # We recreate np.memmap every batch to avoid a memory leak, as per
-    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
-    if split == "train":
-        data = np.memmap(os.path.join(data_dir, "train.bin"), dtype=token_dtype, mode="r")
-    else:
-        data = np.memmap(os.path.join(data_dir, "val.bin"), dtype=token_dtype, mode="r")
+    # Reuse cached memmap to avoid reopening the dataset every batch.
+    data = _get_memmap(split)
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack(
         [torch.from_numpy((data[i : i + block_size]).astype(np.int64)) for i in ix]
@@ -457,6 +453,9 @@ def get_batch(split):
 iter_num = 0
 best_val_loss = 1e9
 current_epoch = 0  # Initialize epoch counter
+resume_run = init_from == "resume"
+resume_wall_time = 0.0
+wandb_run_id = None
 
 # Report vocab size based on selected model
 print(f"Using vocab_size of {vocab_size:,}")
@@ -527,6 +526,8 @@ elif init_from == "resume":
     model.load_state_dict(state_dict)
     iter_num = checkpoint["iter_num"]
     best_val_loss = checkpoint["best_val_loss"]
+    resume_wall_time = checkpoint.get("global_wall_time", 0.0)
+    wandb_run_id = checkpoint.get("wandb_run_id")
     # Restore epoch if present in checkpoint (backward compatibility)
     if "current_epoch" in checkpoint:
         current_epoch = checkpoint["current_epoch"]
@@ -555,6 +556,17 @@ elif is_qwen:
     # keep block_size within Qwen3 context length
     block_size = min(block_size, model_args.get("context_length", block_size))
 model.to(device)
+
+process_start_wall_time = time.time()
+
+
+def current_global_wall_time() -> float:
+    """Return absolute wall-clock seconds since original run start (persisted via checkpoints)."""
+    return resume_wall_time + (time.time() - process_start_wall_time)
+
+# Track resume metadata for logging/eval alignment
+iter_display_offset = 1 if resume_run else 0
+skip_initial_eval = resume_run
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.amp.GradScaler("cuda", enabled=(dtype == "float16"))
@@ -608,6 +620,7 @@ if use_dual_optimizer:
             print("Warning: Loading single optimizer checkpoint into dual optimizer setup")
             # Only load into the first optimizer as a fallback
             optimizer1.load_state_dict(checkpoint["optimizer"])
+        print(f"Resumed from iteration {iter_num}, best_val_loss={best_val_loss:.4f}")
 else:
     # Original single optimizer setup with fallback for models lacking configure_optimizers
     if hasattr(model, "configure_optimizers"):
@@ -626,6 +639,7 @@ else:
     
     if init_from == "resume":
         optimizer.load_state_dict(checkpoint["optimizer"])
+        print(f"Resumed from iteration {iter_num}, best_val_loss={best_val_loss:.4f}")
 
 checkpoint = None  # free up memory
 
@@ -686,7 +700,14 @@ def get_lr(it):
 if wandb_log and master_process:
     import wandb
 
-    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+    resume_kwargs = {}
+    if resume_run and wandb_run_id:
+        resume_kwargs = {"id": wandb_run_id, "resume": "allow"}
+    elif resume_run:
+        print("Warning: resume requested but wandb_run_id missing in checkpoint; starting new W&B run.")
+
+    wandb.init(project=wandb_project, name=wandb_run_name, config=config, **resume_kwargs)
+    wandb_run_id = wandb.run.id if wandb.run else wandb_run_id
 
 wait, warmup, active, repeat = 5, 5, 5, 2
 num_steps = wait + warmup + active
@@ -726,6 +747,19 @@ profiler = (
 if speedrun and master_process:
     print("Speedrun mode enabled! 🏎️ 🏍️ 🐎 🏃‍♀️")
 
+    
+# progress bar (master only; show even if total is unknown)
+# Note: iter_num is set during model initialization (0 for scratch, loaded value for resume)
+progress_bar = None
+if master_process:
+    total_iters = max_iters if max_iters is not None else None
+    progress_bar = tqdm(
+        total=total_iters,
+        initial=iter_num,  # Start from resumed iteration
+        desc="train",
+        leave=True,
+        dynamic_ncols=True,
+    )
 # training loop
 X, Y = get_batch("train")  # fetch the very first batch
 t0 = time.time()
@@ -738,6 +772,7 @@ training_time_ms = 0
 training_time_t0 = time.perf_counter()
 with profiler:
     while True:
+        display_iter = iter_num + iter_display_offset
         # Update epoch counter
         if iterations_per_epoch is not None and iter_num > 0:
             current_epoch = iter_num / iterations_per_epoch
@@ -757,7 +792,14 @@ with profiler:
                 group["momentum"] = (1 - frac) * 0.85 + frac * 0.95  # 0.85 -> 0.95
 
         # evaluate the loss on train/val sets and write checkpoints
-        if iter_num % eval_interval == 0 and iter_num > 0 and master_process:
+        should_eval = (
+            eval_interval
+            and iter_num % eval_interval == 0
+            and master_process
+        )
+        if should_eval and skip_initial_eval:
+            skip_initial_eval = False
+        elif should_eval:
             # stop the clock
             torch.cuda.synchronize()
             training_time_ms += 1000 * (time.perf_counter() - training_time_t0)
@@ -765,7 +807,7 @@ with profiler:
             losses = estimate_loss()
             epoch_str = f" (epoch {current_epoch:.2f})" if iterations_per_epoch else ""
             print(
-                f"step {iter_num}{epoch_str}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f} train_time:{training_time_ms:.0f}ms"
+                f"step {display_iter}{epoch_str}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f} train_time:{training_time_ms:.0f}ms"
             )
             if speedrun and losses["val"] < speedrun_target_eval_loss:
                 print(
@@ -778,15 +820,16 @@ with profiler:
 
             if wandb_log:
                 log_dict = {
-                    "iter": iter_num,
+                    "iter": display_iter,
                     "train/loss": losses["train"],
                     "val/loss": losses["val"],
                     "lr": lr,
                     "mfu": running_mfu * 100,  # convert to percentage
+                    "global_wall_time": current_global_wall_time(),
                 }
                 if iterations_per_epoch:
                     log_dict["epoch"] = current_epoch
-                wandb.log(log_dict)
+                wandb.log(log_dict, step=display_iter)
             if (
                 losses["val"] < best_val_loss or always_save_checkpoint
             ) and not speedrun:
@@ -803,6 +846,8 @@ with profiler:
                         "use_dual_optimizer": use_dual_optimizer,  # Save optimizer type for loading
                         "current_epoch": current_epoch,  # Save epoch information
                         "iterations_per_epoch": iterations_per_epoch,  # Save for consistency checks
+                        "global_wall_time": current_global_wall_time(),
+                        "wandb_run_id": wandb_run_id,
                     }
                     # Construct checkpoint filename with experiment name suffix
                     checkpoint_filename = "ckpt.pt" if not experiment_name else f"ckpt_{experiment_name}.pt"
@@ -861,7 +906,7 @@ with profiler:
             tokens_seen = (iter_num + 1) * tokens_per_iter  # +1 because we log before incrementing iter_num
             lossf = loss.item() * gradient_accumulation_steps
 
-            out_str = f"iter {iter_num}: loss {lossf:.4f}, time {dt * 1000:.2f}ms, tokens ~{tokens_seen:,}"
+            out_str = f"iter {display_iter}: loss {lossf:.4f}, time {dt * 1000:.2f}ms, tokens ~{tokens_seen:,}, wall_time {current_global_wall_time():.1f}s"
 
             if local_iter_num >= 5:
                 mfu = raw_model.estimate_mfu(
