@@ -100,7 +100,7 @@ wandb_run_name = "normal_train_run_" + str(time.time())
 
 # data
 dataset = "openwebtext"
-gradient_accumulation_steps = 8  # used to simulate larger batch sizes
+gradient_accumulation_steps = 16  # used to simulate larger batch sizes
 batch_size = 8  # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 512
 # model
@@ -113,8 +113,8 @@ bias = False  # do we use bias inside LayerNorm and Linear layers?
 learning_rate = 6e-4  # max learning rate (10x for better Muon dual optimizer alignment)
 # Training duration - can specify either max_iters OR max_epochs (not both)
 # If max_epochs is set, max_iters will be calculated automatically based on dataset size
-max_iters = None  # Maximum training iterations (set to None to use max_epochs instead)
-max_epochs = 1  # Maximum training epochs (set to None to use max_iters instead)
+max_iters = 10000  # Maximum training iterations (set to None to use max_epochs instead)
+max_epochs = None  # Maximum training epochs (set to None to use max_iters instead)
 max_tokens = None  # 50_000_000_000 to drive by tokens instead of epochs/iterations
 weight_decay = 1e-1
 beta1 = 0.9

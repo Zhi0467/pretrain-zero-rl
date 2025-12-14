@@ -18,9 +18,10 @@ SCRIPT=${3:-"avatarl"}  # Default to avatarl, can be "train" for regular trainin
 #   CRITIC_HF_MODEL=Qwen/Qwen3-0.6B-Base to use HF critic
 #   USE_4BIT_CRITIC=true/false to override config
 
-# use Qwen3 as default
+# use Qwen3 tokenizer as default
 TOKENIZER=${TOKENIZER:-"qwen3"}
-CRITIC_HF_MODEL=${CRITIC_HF_MODEL:-"Qwen/Qwen3-0.6B-Base"}
+# use unsloth/Qwen3-0.6B-Base-unsloth-bnb-4bit as default critic model
+CRITIC_HF_MODEL=${CRITIC_HF_MODEL:-"unsloth/Qwen3-0.6B-Base-unsloth-bnb-4bit"}
 # Export so python training script can see it
 export TOKENIZER
 

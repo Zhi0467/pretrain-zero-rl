@@ -24,7 +24,7 @@ wandb_run_name = "RL_pretrain_run_" + str(time.time())
 
 # data
 dataset = "openwebtext"
-gradient_accumulation_steps = 8  # Increased from 8 to better utilize GPU (will be divided by world_size)
+gradient_accumulation_steps = 16  # Increased from 8 to better utilize GPU (will be divided by world_size)
 # Note: This will be divided by world_size in DDP, so effective steps per GPU = 4 with 8 GPUs
 batch_size = 8  # Increased from 4 to better utilize GPU memory (adjust down if OOM)
 block_size = 512  # Keeping at 512 to balance memory usage with dual models
@@ -41,8 +41,8 @@ learning_rate = 6e-4  # Adjusted for better stability with AvataRL
 
 # Training duration - can specify either max_iters OR max_epochs (not both)
 # If max_epochs is set, max_iters will be calculated automatically based on dataset size
-max_iters = None  # Maximum training iterations (set to None to use max_epochs instead)
-max_epochs = 1  # Maximum training epochs (set to None to use max_iters instead)
+max_iters = 10000  # Maximum training iterations (set to None to use max_epochs instead)
+max_epochs = None  # Maximum training epochs (set to None to use max_iters instead)
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
@@ -80,17 +80,17 @@ critic_model_path = 'out/ckpt_wandb_logging_fix.pt' # Path to the pre-trained cr
 use_4bit_critic = False  # Whether to load critic model with 4-bit quantization (saves ~75% memory)
 
 # PoE weights
-reality_weight = 0.7
-mentor_weight = 0.3
+reality_weight = 0.2
+mentor_weight = 0.8
 
 # Reality expert settings
-label_smoothing_epsilon = 0.1  # 90% ground truth, 10% spread across action space 
+label_smoothing_epsilon = 0.5  # 50% ground truth, 50% spread across action space 
 
 # Reward settings
 reward_scale = 100.0  # Scale probabilities to meaningful rewards
 
 # Action space
-top_k = 8  # Top-k tokens from both student and teacher
+top_k = 32  # Top-k tokens from both student and teacher
 
 # Policy gradient
 entropy_coefficient = 0.01  # 1% creativity bonus
