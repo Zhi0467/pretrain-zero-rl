@@ -14,10 +14,13 @@ GPUS=${1:-1}  # Default to 1 GPU if not specified
 MODE=${2:-"single"}  # Default to single node
 SCRIPT=${3:-"avatarl"}  # Default to avatarl, can be "train" for regular training
 # Optional controls via env:
-#   TOKENIZER=gpt2|qwen3 (default gpt2) for data prep
+#   TOKENIZER=gpt2|qwen3
 #   CRITIC_HF_MODEL=Qwen/Qwen3-0.6B-Base to use HF critic
 #   USE_4BIT_CRITIC=true/false to override config
-TOKENIZER=${TOKENIZER:-"gpt2"}
+
+# use Qwen3 as default
+TOKENIZER=${TOKENIZER:-"qwen3"}
+CRITIC_HF_MODEL=${CRITIC_HF_MODEL:-"Qwen/Qwen3-0.6B-Base"}
 # Export so python training script can see it
 export TOKENIZER
 
@@ -44,7 +47,10 @@ if ! command -v uv &> /dev/null; then
     echo "Installing uv..."
     curl -sSL https://astral.sh/uv/install.sh | sh
 fi
-uv init
+# initialize uv if pyproject.toml does not exist
+if [ ! -f "pyproject.toml" ]; then
+    uv init
+fi
 
 uv add torch==2.6.0 \
     transformers==4.51.3 \
@@ -102,10 +108,18 @@ if [ "$TOKENIZER" = "gpt2" ]; then
         echo "Data downloaded successfully!"
     fi
 else
-    echo
-    echo "Preparing OpenWebText with tokenizer: $TOKENIZER (this may take a while)..."
-    python3 prepare_data.py --dataset openwebtext --tokenizer "$TOKENIZER"
+    # For Qwen3 (and other tokenizers) avoid reprocessing if bins already exist
+    if [ -f "$DATA_DIR/train.bin" ] && [ -f "$DATA_DIR/val.bin" ] && [ "${FORCE_PREPARE:-0}" != "1" ]; then
+        echo
+        echo "Found existing $DATA_DIR/train.bin and val.bin; skip prepare_data.py (set FORCE_PREPARE=1 to rebuild)."
+    else
+        echo
+        echo "Preparing OpenWebText with tokenizer: $TOKENIZER (this may take a while)..."
+        python3 prepare_data.py --dataset openwebtext --tokenizer "$TOKENIZER"
+    fi
 fi
+echo "=== Data Preparation Complete ==="
+echo
 
 # Check for critic model (only needed for AvataRL)
 if [ "$SCRIPT" = "avatarl" ]; then

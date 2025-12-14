@@ -50,7 +50,7 @@ def _get_tokenizer(tokenizer_name: str):
         from models.qwen_tokenizer import Qwen3Tokenizer
 
         repo_id = os.environ.get("QWEN3_TOKENIZER_REPO", "Qwen/Qwen3-0.6B-Base")
-        tok_file = os.environ.get("QWEN3_TOKENIZER_FILE", "tokenizer-qwen3.json")
+        tok_file = os.environ.get("QWEN3_TOKENIZER_FILE", "tokenizer.json")
         qwen_tok = Qwen3Tokenizer(
             tokenizer_file_path=tok_file,
             repo_id=repo_id,
@@ -180,8 +180,8 @@ def prepare_openwebtext(tokenizer: str = "gpt2"):
         arr.flush()
     
     print(f"Saved train.bin and val.bin to {data_dir}")
-    print(f"Train tokens: {tokenized['train']['len'].sum():,}")
-    print(f"Val tokens: {tokenized['val']['len'].sum():,}")
+    print(f"Train tokens: {np.sum(tokenized['train']['len']):,}")
+    print(f"Val tokens: {np.sum(tokenized['val']['len']):,}")
     print(f"Tokenizer: {tokenizer} | Vocab size: {vocab_size}")
 
 def prepare_custom(data_path: str, tokenizer: str = "gpt2"):

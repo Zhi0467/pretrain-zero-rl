@@ -27,6 +27,7 @@ from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 import torch.distributed as dist
+from tqdm import tqdm
 
 from models.gpt2 import GPTConfig, GPT
 from load_critic_hf import load_critic_model_hf
@@ -35,11 +36,13 @@ from models.qwen3 import Qwen3Model, QWEN_CONFIG_06_B
 # Import all configuration variables
 from config.train_avatarl import *
 # load wandb api key, project, and entity from .env
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 from pathlib import Path
 import wandb
-# load .env from root directory
-load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env")
+# Load .env (prefer repo root, but also respect any parent/cwd .env)
+repo_root_env = Path(__file__).resolve().parents[1] / ".env"
+load_dotenv(find_dotenv())  # pick up a .env in cwd/parents if present
+load_dotenv(dotenv_path=repo_root_env)  # ensure repo-root .env is loaded
 wandb_api_key = os.environ.get("WANDB_API_KEY")
 wandb_project = os.environ.get("WANDB_PROJECT")
 if not wandb_api_key or not wandb_project:
@@ -63,7 +66,7 @@ config = {k: globals()[k] for k in config_keys}  # will be useful for logging
 
 def _get_tokenizer_name() -> str:
     # start.sh exports TOKENIZER; default to gpt2 for backward compatibility
-    return os.environ.get("TOKENIZER", "gpt2").lower()
+    return os.environ.get("TOKENIZER", "qwen3").lower()
 
 
 def _get_vocab_size_for_tokenizer(tokenizer_name: str) -> int:
@@ -166,6 +169,17 @@ def load_critic_model(checkpoint_path: str):
     print(f"Memory usage: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
 
     return critic_model
+
+
+def _extract_logits(output):
+    """Normalize logits extraction across GPT and HF models."""
+    if isinstance(output, (tuple, list)):
+        return output[0]
+    if isinstance(output, dict) and "logits" in output:
+        return output["logits"]
+    if hasattr(output, "logits"):
+        return output.logits
+    raise TypeError(f"Unsupported model output type for logits extraction: {type(output)}")
 
 
 def compute_avatarl_loss(
@@ -449,6 +463,16 @@ data_dir = os.path.join("data", dataset)
 # Dataset size tracking for epoch calculation
 train_data_size = None
 val_data_size = None
+# init these up here, can override if init_from='resume' (i.e. from a checkpoint)
+iter_num = 0
+best_val_loss = 1e9
+current_epoch = 0  # Initialize epoch counter
+
+tokenizer_name = _get_tokenizer_name()
+vocab_size = _get_vocab_size_for_tokenizer(tokenizer_name)
+bin_dtype = _get_bin_dtype_for_vocab_size(vocab_size)
+print(f"Tokenizer: {tokenizer_name} | vocab_size={vocab_size} | bin_dtype={bin_dtype}")
+
 
 def get_dataset_size(split):
     """Get the size of a dataset split in tokens"""
@@ -458,7 +482,7 @@ def get_dataset_size(split):
     elif split == "val" and val_data_size is not None:
         return val_data_size
     
-    data = np.memmap(os.path.join(data_dir, f"{split}.bin"), dtype=np.uint16, mode="r")
+    data = np.memmap(os.path.join(data_dir, f"{split}.bin"), dtype=bin_dtype, mode="r")
     size = len(data)
     
     if split == "train":
@@ -474,10 +498,9 @@ try:
         train_tokens = get_dataset_size("train")
         # Number of sequences we can sample from the dataset
         num_sequences = train_tokens - block_size + 1
-        # Iterations per epoch = sequences / (batch_size * gradient_accumulation_steps * world_size)
-        iterations_per_epoch = num_sequences // (batch_size * gradient_accumulation_steps * ddp_world_size)
+        iterations_per_epoch = math.ceil(train_tokens / tokens_per_iter)   # or use // for floor
         tokens_per_epoch = iterations_per_epoch * tokens_per_iter
-        
+                
         print(f"dataset has {train_tokens:,} tokens")
         print(f"iterations per epoch: {iterations_per_epoch:,}")
         print(f"tokens per epoch: {tokens_per_epoch:,}")
@@ -509,6 +532,18 @@ if max_iters is None:
         # Both max_iters and max_epochs are None - use default
         print(f"WARNING: Neither max_iters nor max_epochs specified. Using default max_iters=10000")
         max_iters = 10000
+
+# progress bar (master only; show even if total is unknown)
+progress_bar = None
+if master_process:
+    total_iters = max_iters if max_iters is not None else None
+    progress_bar = tqdm(
+        total=total_iters,
+        initial=0,
+        desc="train",
+        leave=True,
+        dynamic_ncols=True,
+    )
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
@@ -649,47 +684,6 @@ class Muon(torch.optim.Optimizer):
                 params_world = params[base_i : base_i + self.world_size]
             update_prev()
 
-# -----------------------------------------------------------------------------
-# poor man's data loader
-
-def get_batch(split):
-    # We recreate np.memmap every batch to avoid a memory leak, as per
-    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
-    if split == "train":
-        data = np.memmap(os.path.join(data_dir, "train.bin"), dtype=bin_dtype, mode="r")
-    else:
-        data = np.memmap(os.path.join(data_dir, "val.bin"), dtype=bin_dtype, mode="r")
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack(
-        [torch.from_numpy((data[i : i + block_size]).astype(np.int64)) for i in ix]
-    )
-    y = torch.stack(
-        [
-            torch.from_numpy((data[i + 1 : i + 1 + block_size]).astype(np.int64))
-            for i in ix
-        ]
-    )
-    if device_type == "cuda":
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = (
-            x.pin_memory().to(device, non_blocking=True),
-            y.pin_memory().to(device, non_blocking=True),
-        )
-    else:
-        x, y = x.to(device), y.to(device)
-    return x, y
-
-
-# init these up here, can override if init_from='resume' (i.e. from a checkpoint)
-iter_num = 0
-best_val_loss = 1e9
-current_epoch = 0  # Initialize epoch counter
-
-# Always use GPT-2 vocab size
-tokenizer_name = _get_tokenizer_name()
-vocab_size = _get_vocab_size_for_tokenizer(tokenizer_name)
-bin_dtype = _get_bin_dtype_for_vocab_size(vocab_size)
-print(f"Tokenizer: {tokenizer_name} | vocab_size={vocab_size} | bin_dtype={bin_dtype}")
 
 # model init
 if tokenizer_name == "qwen3":
@@ -763,9 +757,10 @@ else:
 
 model.to(device)
 
-# Load critic model for AvataRL
-critic_model = load_critic_model(critic_model_path)
-print(f"Teacher model loaded from {critic_model_path}")
+# Load critic model for AvataRL (supports HF via CRITIC_HF_MODEL or hf: prefix)
+critic_source = os.environ.get("CRITIC_HF_MODEL") or critic_model_path
+critic_model = load_critic_model(critic_source)
+print(f"Teacher model loaded from {critic_source}")
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.amp.GradScaler("cuda", enabled=(dtype == "float16"))
@@ -859,6 +854,35 @@ if ddp:
         bucket_cap_mb=ddp_bucket_cap_mb,
     )
 
+# -----------------------------------------------------------------------------
+# poor man's data loader
+
+def get_batch(split):
+    # We recreate np.memmap every batch to avoid a memory leak, as per
+    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
+    if split == "train":
+        data = np.memmap(os.path.join(data_dir, "train.bin"), dtype=bin_dtype, mode="r")
+    else:
+        data = np.memmap(os.path.join(data_dir, "val.bin"), dtype=bin_dtype, mode="r")
+    ix = torch.randint(len(data) - block_size, (batch_size,))
+    x = torch.stack(
+        [torch.from_numpy((data[i : i + block_size]).astype(np.int64)) for i in ix]
+    )
+    y = torch.stack(
+        [
+            torch.from_numpy((data[i + 1 : i + 1 + block_size]).astype(np.int64))
+            for i in ix
+        ]
+    )
+    if device_type == "cuda":
+        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
+        x, y = (
+            x.pin_memory().to(device, non_blocking=True),
+            y.pin_memory().to(device, non_blocking=True),
+        )
+    else:
+        x, y = x.to(device), y.to(device)
+    return x, y
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
@@ -877,7 +901,8 @@ def estimate_loss():
                 student_logits, _ = model(X, Y)
                 
                 with torch.no_grad():
-                    critic_logits, _ = critic_model(X, Y)
+                    critic_out = critic_model(X, Y) if hasattr(critic_model, "__call__") else critic_model(X)
+                    critic_logits = _extract_logits(critic_out)
                 
                 loss, _ = compute_avatarl_loss(
                     student_logits, critic_logits, Y,
@@ -1078,7 +1103,8 @@ with profiler:
                 
                 # Get critic logits for AvataRL
                 with torch.no_grad():
-                    critic_logits, _ = critic_model(X, Y)
+                    critic_out = critic_model(X, Y) if hasattr(critic_model, "__call__") else critic_model(X)
+                    critic_logits = _extract_logits(critic_out)
                 
                 # Compute AvataRL loss
                 loss, avatarl_metrics = compute_avatarl_loss(
@@ -1168,6 +1194,8 @@ with profiler:
 
         iter_num += 1
         local_iter_num += 1
+        if progress_bar is not None:
+            progress_bar.update(1)
 
         if profile:
             profiler.step()
@@ -1178,3 +1206,5 @@ with profiler:
 
 if ddp:
     destroy_process_group()
+if progress_bar is not None:
+    progress_bar.close()

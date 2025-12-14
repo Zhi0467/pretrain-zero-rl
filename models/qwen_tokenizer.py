@@ -20,7 +20,7 @@ class Qwen3Tokenizer:
     _SPLIT_RE = re.compile(r"(<\|[^>]+?\|>|<think>|</think>)")
 
     def __init__(self, tokenizer_file_path="tokenizer.json", repo_id=None,
-                 apply_chat_template=True, add_generation_prompt=False, add_thinking=False):
+                 apply_chat_template=False, add_generation_prompt=False, add_thinking=False):
         from tokenizers import Tokenizer
 
         self.apply_chat_template = apply_chat_template
@@ -50,25 +50,14 @@ class Qwen3Tokenizer:
             eos_token = "<|endoftext|>"
         if eos_token in self._special_to_id:
             self.eos_token_id = self._special_to_id[eos_token]
-
+    
     def encode(self, text, chat_wrapped=None):
         if chat_wrapped is None:
             chat_wrapped = self.apply_chat_template
-
-        stripped = text.strip()
-        if stripped in self._special_to_id and "\n" not in stripped:
-            return [self._special_to_id[stripped]]
-
         if chat_wrapped:
             text = self._wrap_chat(text)
+        return self._tok.encode(text, add_special_tokens=False).ids
 
-        ids = []
-        for part in filter(None, self._SPLIT_RE.split(text)):
-            if part in self._special_to_id:
-                ids.append(self._special_to_id[part])
-            else:
-                ids.extend(self._tok.encode(part).ids)
-        return ids
 
     def decode(self, ids):
         return self._tok.decode(ids, skip_special_tokens=False)
@@ -135,3 +124,20 @@ def download_from_huggingface_from_snapshots(repo_id, local_dir):
         raise FileNotFoundError("No model.safetensors or model.safetensors.index.json found.")
 
     return weights_dict
+
+if __name__ == "__main__":
+    # initialize tokenizer
+    tokenizer = Qwen3Tokenizer(
+        tokenizer_file_path="tokenizer.json",
+        repo_id="Qwen/Qwen3-0.6B-Base",
+        apply_chat_template=False,
+        add_generation_prompt=False,
+        add_thinking=False,
+    )
+    # print the token id of "<|im_start|>"
+    tid = tokenizer._tok.token_to_id("<|im_start|>")
+    print(tokenizer._tok.encode("<|im_start|>", add_special_tokens=False).ids, tid)
+    # iterate over the special tokens and print the token id
+    for special_token in tokenizer._SPECIALS:
+        tid = tokenizer._tok.token_to_id(special_token)
+        print(tokenizer._tok.encode(special_token, add_special_tokens=False).ids, tid)

@@ -27,35 +27,82 @@ from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 import torch.distributed as dist
+from tqdm import tqdm
 
 from models.gpt2 import GPTConfig, GPT
+from models.qwen3 import Qwen3Model, QWEN_CONFIG_06_B
 
+# load wandb api key, project, and entity from .env
+from dotenv import load_dotenv, find_dotenv
+from pathlib import Path
+import wandb
+# Load .env (prefer repo root, but also respect any parent/cwd .env)
+repo_root_env = Path(__file__).resolve().parents[1] / ".env"
+load_dotenv(find_dotenv())  # pick up a .env in cwd/parents if present
+load_dotenv(dotenv_path=repo_root_env)  # ensure repo-root .env is loaded
+wandb_api_key = os.environ.get("WANDB_API_KEY")
+wandb_project = os.environ.get("WANDB_PROJECT")
+if not wandb_api_key or not wandb_project:
+    raise ValueError("WANDB_API_KEY and WANDB_PROJECT must be set")
+
+def _configure_optimizers_generic(model, weight_decay, learning_rate, betas, device_type):
+    """
+    Generic AdamW optimizer configuration (GPT-style):
+    - Apply weight decay to 2D+ parameters; none to biases/norms (1D)
+    """
+    # start with all of the candidate parameters
+    param_dict = {pn: p for pn, p in model.named_parameters()}
+    # filter out those that do not require grad
+    param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+
+    decay_params = [p for _, p in param_dict.items() if p.dim() >= 2]
+    nodecay_params = [p for _, p in param_dict.items() if p.dim() < 2]
+    optim_groups = [
+        {"params": decay_params, "weight_decay": weight_decay},
+        {"params": nodecay_params, "weight_decay": 0.0},
+    ]
+
+    fused_available = "fused" in torch.optim.AdamW.__init__.__code__.co_varnames
+    use_fused = fused_available and device_type == "cuda"
+    extra_args = dict(fused=True) if use_fused else dict()
+    optimizer = torch.optim.AdamW(
+        optim_groups, lr=learning_rate, betas=betas, **extra_args
+    )
+    print(f"using fused AdamW: {use_fused}")
+    return optimizer
+    
 # Whether to do a https://github.dev/KellerJordan/modded-nanogpt style speedrun test.
 speedrun = os.environ.get("NANOGPT_SPEEDRUN", "false").lower() in ("true", "1")
 # Whether we're benchmarking - this calculates MFU on each iteration.
 bench = os.environ.get("NANOGPT_BENCH", "false").lower() in ("true", "1")
 speedrun_target_eval_loss = 3.28
 # -----------------------------------------------------------------------------
+# model selection (default to Qwen3)
+# use the env varible TOKENIZER as MODEL_TYPE
+model_type = os.environ.get("TOKENIZER", "qwen3").lower()
+is_qwen = model_type.startswith("qwen")
+default_qwen_cfg = QWEN_CONFIG_06_B.copy()
+
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = "out"
-experiment_name = "regular_pretrain_250M_adamw_big_critic"  # optional experiment name suffix for checkpoint files
+experiment_name = "normal_pretrain_qwen3_0.6b_base"  # optional experiment name suffix for checkpoint files
 # every how many steps to evaluate val loss? 0 for only at the end
-eval_interval = 500 if not speedrun else 125  # 125 is used in modded-nanogpt
-log_interval = 10
-eval_iters = 200
+eval_interval = 1000 if not speedrun else 125  # 125 is used in modded-nanogpt
+log_interval = 100
+eval_iters = 100
 eval_only = False  # if True, script exits right after the first eval
 always_save_checkpoint = True  # if True, always save a checkpoint after each eval
 init_from = "scratch"  # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = True  # disabled by default
-wandb_project = "nanogpt-avatarl"
-wandb_run_name = "run_" + str(time.time())  # 'run' + str(time.time())
+wandb_run_name = "normal_train_run_" + str(time.time())  
+
 # data
-dataset = "shakespeare"
+dataset = "openwebtext"
 gradient_accumulation_steps = 8  # used to simulate larger batch sizes
-batch_size = 64  # if gradient_accumulation_steps > 1, this is the micro-batch size
-block_size = 1024
+batch_size = 8  # if gradient_accumulation_steps > 1, this is the micro-batch size
+block_size = 512
 # model
 n_layer = 16
 n_head = 16
@@ -94,6 +141,15 @@ device = (
 )
 dtype = "bfloat16"  # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True  # use PyTorch 2.0 to compile the model to be faster
+# Switch defaults to Qwen3 (0.6B) unless MODEL_TYPE is set otherwise
+if is_qwen:
+    n_layer = default_qwen_cfg["n_layers"]
+    n_head = default_qwen_cfg["n_heads"]
+    n_embd = default_qwen_cfg["emb_dim"]
+    vocab_size = default_qwen_cfg["vocab_size"]
+    block_size = min(block_size, default_qwen_cfg["context_length"])
+else:
+    vocab_size = 50304  # GPT-2 vocab_size, padded for efficiency
 # Whether to profile the model. Profiling is already setup in bench.py but that doesn't
 # work with DDP, we this train.py script also profiles.
 profile: bool = os.environ.get("NANOGPT_PROFILE", "false").lower() in ("true", "1")
@@ -139,20 +195,24 @@ if 'max_tokens' in globals() and max_tokens is not None and max_iters is None:
     print(f"planning for ~{max_tokens:,} tokens ⇒ {max_iters:,} updates")
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
+# Select dataset dtype based on vocab size (Qwen3 uses uint32)
+token_dtype = np.uint32 if vocab_size > np.iinfo(np.uint16).max else np.uint16
+
+
 # Calculate epoch information if dataset exists
 data_dir = os.path.join("data", dataset)
 try:
     if os.path.exists(os.path.join(data_dir, "train.bin")):
         # Import get_dataset_size function (will be defined later in the file)
         # For now, read dataset size directly here
-        train_data = np.memmap(os.path.join(data_dir, "train.bin"), dtype=np.uint16, mode="r")
+        train_data = np.memmap(os.path.join(data_dir, "train.bin"), dtype=token_dtype, mode="r")
         train_tokens = len(train_data)
         del train_data  # Release memmap
         
         # Number of sequences we can sample from the dataset
         num_sequences = max(0, train_tokens - block_size)
         # Iterations per epoch = sequences / (batch_size * gradient_accumulation_steps * world_size)
-        iterations_per_epoch = num_sequences // (batch_size * gradient_accumulation_steps * ddp_world_size)
+        iterations_per_epoch = math.ceil(train_tokens / tokens_per_iter)   # or use // for floor
         tokens_per_epoch = iterations_per_epoch * tokens_per_iter
         
         print(f"dataset has {train_tokens:,} tokens")
@@ -187,6 +247,18 @@ if max_iters is None:
         # Both max_iters and max_epochs are None - use default
         print(f"WARNING: Neither max_iters nor max_epochs specified. Using default max_iters=10000")
         max_iters = 10000
+
+# progress bar (master only; show even if total is unknown)
+progress_bar = None
+if master_process:
+    total_iters = max_iters if max_iters is not None else None
+    progress_bar = tqdm(
+        total=total_iters,
+        initial=0,
+        desc="train",
+        leave=True,
+        dynamic_ncols=True,
+    )
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
@@ -343,7 +415,7 @@ def get_dataset_size(split):
     elif split == "val" and val_data_size is not None:
         return val_data_size
     
-    data = np.memmap(os.path.join(data_dir, f"{split}.bin"), dtype=np.uint16, mode="r")
+    data = np.memmap(os.path.join(data_dir, f"{split}.bin"), dtype=token_dtype, mode="r")
     size = len(data)
     
     if split == "train":
@@ -357,9 +429,9 @@ def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
     if split == "train":
-        data = np.memmap(os.path.join(data_dir, "train.bin"), dtype=np.uint16, mode="r")
+        data = np.memmap(os.path.join(data_dir, "train.bin"), dtype=token_dtype, mode="r")
     else:
-        data = np.memmap(os.path.join(data_dir, "val.bin"), dtype=np.uint16, mode="r")
+        data = np.memmap(os.path.join(data_dir, "val.bin"), dtype=token_dtype, mode="r")
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack(
         [torch.from_numpy((data[i : i + block_size]).astype(np.int64)) for i in ix]
@@ -386,24 +458,31 @@ iter_num = 0
 best_val_loss = 1e9
 current_epoch = 0  # Initialize epoch counter
 
-# Always use GPT-2 vocab size
-print("Using GPT-2 vocab_size of 50304 (50257 rounded up for efficiency)")
+# Report vocab size based on selected model
+print(f"Using vocab_size of {vocab_size:,}")
 
 # model init
-model_args = dict(
-    n_layer=n_layer,
-    n_head=n_head,
-    n_embd=n_embd,
-    block_size=block_size,
-    bias=bias,
-    vocab_size=50304,  # GPT-2 vocab_size, padded for efficiency
-    dropout=dropout,
-)  # start with model_args from command line
+if is_qwen:
+    model_args = default_qwen_cfg.copy()
+else:
+    model_args = dict(
+        n_layer=n_layer,
+        n_head=n_head,
+        n_embd=n_embd,
+        block_size=block_size,
+        bias=bias,
+        vocab_size=vocab_size,  # GPT-2 vocab_size, padded for efficiency
+        dropout=dropout,
+    )  # start with model_args from command line
 if init_from == "scratch":
     # init a new model from scratch
-    print("Initializing a new model from scratch")
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
+    if is_qwen:
+        print("Initializing a Qwen3 model from scratch")
+        model = Qwen3Model(model_args)
+    else:
+        print("Initializing a new model from scratch")
+        gptconf = GPTConfig(**model_args)
+        model = GPT(gptconf)
 elif init_from == "resume":
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
@@ -420,13 +499,24 @@ elif init_from == "resume":
     
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint["model_args"]
-    # force these config attributes to be equal otherwise we can't even resume training
-    # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in ["n_layer", "n_head", "n_embd", "block_size", "bias", "vocab_size"]:
-        model_args[k] = checkpoint_model_args[k]
-    # create the model
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
+    checkpoint_model_type = checkpoint.get(
+        "model_type",
+        "qwen3" if "context_length" in checkpoint_model_args else "gpt2",
+    )
+    model_type = checkpoint_model_type
+    is_qwen = model_type.startswith("qwen")
+    model_args = checkpoint_model_args
+    if is_qwen:
+        print("Loading Qwen3 model from checkpoint")
+        model = Qwen3Model(model_args)
+    else:
+        # force these config attributes to be equal otherwise we can't even resume training
+        # the rest of the attributes (e.g. dropout) can stay as desired from command line
+        for k in ["n_layer", "n_head", "n_embd", "block_size", "bias", "vocab_size"]:
+            model_args[k] = checkpoint_model_args[k]
+        # create the model
+        gptconf = GPTConfig(**model_args)
+        model = GPT(gptconf)
     state_dict = checkpoint["model"]
     # fix the keys of the state dictionary :(
     # honestly no idea how checkpoints sometimes get this prefix, have to debug more
@@ -450,12 +540,20 @@ elif init_from.startswith("gpt2"):
     # read off the created config params, so we can store them into checkpoint correctly
     for k in ["n_layer", "n_head", "n_embd", "block_size", "bias", "vocab_size"]:
         model_args[k] = getattr(model.config, k)
-# crop down the model block size if desired, using model surgery
-if block_size < model.config.block_size:
-    model.crop_block_size(block_size)
-    model_args["block_size"] = (
-        block_size  # so that the checkpoint will have the right value
-    )
+# Ensure we use the right vocab size and token dtype going forward
+vocab_size = model_args.get("vocab_size", vocab_size)
+token_dtype = np.uint32 if vocab_size > np.iinfo(np.uint16).max else np.uint16
+
+# crop down the model block size if desired, using model surgery (GPT-only)
+if hasattr(model, "config") and hasattr(model.config, "block_size"):
+    if block_size < model.config.block_size:
+        model.crop_block_size(block_size)
+        model_args["block_size"] = (
+            block_size  # so that the checkpoint will have the right value
+        )
+elif is_qwen:
+    # keep block_size within Qwen3 context length
+    block_size = min(block_size, model_args.get("context_length", block_size))
 model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
@@ -511,10 +609,15 @@ if use_dual_optimizer:
             # Only load into the first optimizer as a fallback
             optimizer1.load_state_dict(checkpoint["optimizer"])
 else:
-    # Original single optimizer setup
-    optimizer = model.configure_optimizers(
-        weight_decay, learning_rate, (beta1, beta2), device_type
-    )
+    # Original single optimizer setup with fallback for models lacking configure_optimizers
+    if hasattr(model, "configure_optimizers"):
+        optimizer = model.configure_optimizers(
+            weight_decay, learning_rate, (beta1, beta2), device_type
+        )
+    else:
+        optimizer = _configure_optimizers_generic(
+            model, weight_decay, learning_rate, (beta1, beta2), device_type
+        )
     optimizers = [optimizer]  # Wrap in list for consistency
     
     # Store initial learning rate
@@ -693,6 +796,7 @@ with profiler:
                         "model": raw_model.state_dict(),
                         "optimizer": [opt.state_dict() for opt in optimizers] if use_dual_optimizer else optimizers[0].state_dict(),
                         "model_args": model_args,
+                        "model_type": model_type,
                         "iter_num": iter_num,
                         "best_val_loss": best_val_loss,
                         "config": config,
@@ -772,6 +876,8 @@ with profiler:
 
         iter_num += 1
         local_iter_num += 1
+        if progress_bar is not None:
+            progress_bar.update(1)
 
         if profile:
             profiler.step()
@@ -782,3 +888,5 @@ with profiler:
 
 if ddp:
     destroy_process_group()
+if progress_bar is not None:
+    progress_bar.close()

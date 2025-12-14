@@ -218,3 +218,7 @@ issues/
 .venv/
 uv.lock
 .env
+
+# tokenizer files
+tokenizer.json
+tokenizer_config.json

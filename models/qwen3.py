@@ -6,6 +6,7 @@
 import os
 import json
 import re
+import subprocess
 from pathlib import Path
 
 import requests
@@ -147,6 +148,7 @@ class Qwen3Model(nn.Module):
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
         self.cfg = cfg
+        self.flops_promised = None
 
     def forward(self, in_idx, targets=None, mask=None):
         """
@@ -191,6 +193,43 @@ class Qwen3Model(nn.Module):
             loss = None
 
         return logits, loss
+
+    def get_num_params(self):
+        return sum(p.numel() for p in self.parameters())
+
+    def estimate_mfu(self, fwdbwd_per_iter, dt):
+        """
+        Rough MFU estimate mirrored from GPT implementation.
+        """
+        N = self.get_num_params()
+        cfg = self.cfg
+        L = cfg["n_layers"]
+        H = cfg["n_heads"]
+        Q = cfg["emb_dim"] // cfg["n_heads"]
+        T = min(cfg["context_length"], self.cos.shape[0])
+
+        flops_per_token = 6 * N + 12 * L * H * Q * T
+        flops_per_fwdbwd = flops_per_token * T
+        flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
+
+        if self.flops_promised is None:
+            gpu_model = subprocess.run(
+                "nvidia-smi --query-gpu=name --format=csv,noheader -i 0",
+                shell=True,
+                text=True,
+                capture_output=True,
+            ).stdout.strip()
+            if "A100" in gpu_model:
+                self.flops_promised = 312e12  # bfloat16
+            elif "H100" in gpu_model or "H200" in gpu_model:
+                self.flops_promised = 989e12  # bfloat16
+            else:
+                print(f"WARNING: Unknown GPU model {gpu_model}, assuming A100")
+                self.flops_promised = 312e12
+
+        flops_achieved = flops_per_iter * (1.0 / dt)
+        mfu = flops_achieved / self.flops_promised
+        return mfu
 
 
 class TransformerBlock(nn.Module):
