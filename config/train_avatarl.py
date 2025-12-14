@@ -81,19 +81,19 @@ use_4bit_critic = False  # Whether to load critic model with 4-bit quantization 
 
 # PoE weights
 reality_weight = 0.2
-mentor_weight = 0.8
+mentor_weight = 0.5
 
 # Reality expert settings
-label_smoothing_epsilon = 0.5  # 50% ground truth, 50% spread across action space 
+label_smoothing_epsilon = 0.5
 
 # Reward settings
 reward_scale = 100.0  # Scale probabilities to meaningful rewards
 
 # Action space
-top_k = 32  # Top-k tokens from both student and teacher
+top_k = 64  # Top-k tokens from both student and teacher
 
 # Policy gradient
-entropy_coefficient = 0.01  # 1% creativity bonus
+entropy_coefficient = 0.05  # 5% creativity bonus
 
 # Training stability
 max_reward_clamp = 1.5  # Clamp rewards to prevent gradient explosion

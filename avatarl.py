@@ -241,21 +241,17 @@ def compute_avatarl_loss(
     # Get student's top-k predictions
     _, student_top_k_indices = student_logits_flat.topk(top_k, dim=-1)
     
-    # Get critic's top-k predictions
-    _, critic_top_k_indices = critic_logits_flat.topk(top_k, dim=-1)
-    
-    # Combine student, critic, and ground truth indices
-    # Shape: (batch_size * seq_len, top_k * 2 + 1)
+    # Combine student top-k and ground truth indices (critic actions excluded)
+    # Shape: (batch_size * seq_len, top_k + 1)
     combined_indices = torch.cat([
         student_top_k_indices,
-        critic_top_k_indices,
         ground_truth_flat.unsqueeze(1)
     ], dim=1)
     
     # FULLY VECTORIZED: Remove duplicates while keeping first occurrence
     # No python loops - pure GPU tensor operations
     batch_size_seq = combined_indices.size(0)
-    max_actions = 2 * top_k + 1  # Dynamic calculation based on top_k
+    max_actions = top_k + 1  # student top-k + ground truth
     
     # Sort each row and find unique consecutive values
     sorted_indices, sort_idx = combined_indices.sort(dim=1)
@@ -382,6 +378,11 @@ def compute_avatarl_loss(
     # Apply proportional rescaling to maintain relative differences
     action_rewards = action_rewards * rescale_factor
     
+    # --- Step 3.5: Convert rewards to advantages (baseline: mean over valid actions)
+    valid_action_counts = action_masks.sum(dim=1, keepdim=True).clamp(min=1)
+    baseline = action_rewards.sum(dim=1, keepdim=True) / valid_action_counts
+    action_advantages = (action_rewards - baseline) * action_masks.float()
+    
     # --- Step 4: Calculate Policy Gradient Loss ---
     # Apply temperature scaling for exploration (replaces entropy regularization)
     # Higher temperature = more exploration, lower temperature = more exploitation
@@ -394,13 +395,13 @@ def compute_avatarl_loss(
 
     # gather only the action tokens' log-probs for the policy gradient (B*T, max_actions)
     student_log_probs_for_actions = student_log_probs_full.gather(1, action_indices_padded)
-
+    
     # mask out padding in the action set
     student_log_probs_for_actions = student_log_probs_for_actions * action_masks.float()
     
-    # Policy gradient loss: -sum(log_policy * reward)
-    # Detach rewards as they are fixed targets
-    policy_gradient_loss = -(student_log_probs_for_actions * action_rewards.detach()).sum(dim=1)
+    # Policy gradient loss: -sum(log_policy * advantage)
+    # Detach advantages as they are fixed targets
+    policy_gradient_loss = -(student_log_probs_for_actions * action_advantages.detach()).sum(dim=1)
     
     # Normalize by number of valid actions
     num_valid_actions = action_masks.sum(dim=1).float()
