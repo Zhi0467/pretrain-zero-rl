@@ -888,6 +888,13 @@ else:
 
 checkpoint = None  # free up memory
 
+# wrap model into DDP container
+if ddp:
+    model = DDP(
+        model,
+        device_ids=[ddp_local_rank],
+        bucket_cap_mb=ddp_bucket_cap_mb,
+    )
 # compile the model
 if compile:
     print("compiling the model... (takes a ~minute)")
@@ -896,14 +903,6 @@ if compile:
     model = torch.compile(model)  # requires PyTorch 2.0
     compile_time = time.time() - t0_compile
     print(f"Compilation completed in {compile_time:.2f} seconds")
-
-# wrap model into DDP container
-if ddp:
-    model = DDP(
-        model,
-        device_ids=[ddp_local_rank],
-        bucket_cap_mb=ddp_bucket_cap_mb,
-    )
 
 # -----------------------------------------------------------------------------
 # poor man's data loader

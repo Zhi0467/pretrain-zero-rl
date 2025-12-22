@@ -10,7 +10,9 @@ echo "=== AvataRL Local Training Script ==="
 echo
 
 # Parse command line arguments
-GPUS=${1:-1}  # Default to 1 GPU if not specified
+# If SLURM_GPUS_ON_NODE is set, use it; otherwise use CLI arg; otherwise default 1
+GPUS=${SLURM_GPUS_ON_NODE:-${1:-1}}
+echo "Using $GPUS GPUs per node"
 MODE=${2:-"single"}  # Default to single node
 SCRIPT=${3:-"avatarl"}  # Default to avatarl, can be "train" for regular training
 # Optional controls via env:
@@ -51,18 +53,26 @@ fi
 # initialize uv if pyproject.toml does not exist
 if [ ! -f "pyproject.toml" ]; then
     uv init
-fi
-
-uv add torch==2.6.0 \
+    uv add torch==2.6.0 \
     transformers==4.51.3 \
     datasets==3.6.0 \
     tiktoken==0.9.0 \
     tokenizers==0.21.0 \
     wandb==0.19.11 \
     tqdm==4.67.1 \
-    python-dotenv==1.2.1 \
+    python-dotenv==1.2.1
+fi
 
+# otherwise, simply sync the dependencies
 uv sync
+
+# activate the virtual environment
+source "$HOME/pretrain-zero-rl/.venv/bin/activate"
+
+# Explicitly install PyTorch Nightly for Blackwell support
+# We use standard nightly index which usually covers latest archs
+echo "Installing PyTorch Nightly..."
+uv pip install --upgrade --pre torch --index-url https://download.pytorch.org/whl/nightly/cu128
 
 # Check for data (tokenizer-aware)
 DATA_DIR="data/openwebtext"

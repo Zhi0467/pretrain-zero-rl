@@ -41,8 +41,8 @@ learning_rate = 6e-4  # Adjusted for better stability with AvataRL
 
 # Training duration - can specify either max_iters OR max_epochs (not both)
 # If max_epochs is set, max_iters will be calculated automatically based on dataset size
-max_iters = 10000  # Maximum training iterations (set to None to use max_epochs instead)
-max_epochs = None  # Maximum training epochs (set to None to use max_iters instead)
+max_iters = None  # Maximum training iterations (set to None to use max_epochs instead)
+max_epochs = 1  # Maximum training epochs (set to None to use max_iters instead)
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
@@ -68,7 +68,7 @@ backend = "nccl"
 # system
 device = "cuda"
 dtype = "bfloat16"
-compile = True
+compile = False
 profile = False  # Whether to profile the model (for performance analysis)
 speedrun = False  # Whether to do a modded-nanogpt style speedrun test
 bench = False  # Whether we're benchmarking - calculates MFU on each iteration

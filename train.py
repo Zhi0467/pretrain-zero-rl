@@ -93,7 +93,7 @@ log_interval = 50
 eval_iters = 100
 eval_only = False  # if True, script exits right after the first eval
 always_save_checkpoint = True  # if True, always save a checkpoint after each eval
-init_from = "resume"  # 'scratch' or 'resume' 
+init_from = "scratch"  # 'scratch' or 'resume' 
 
 # wandb logging
 wandb_log = True  # disabled by default
@@ -114,8 +114,8 @@ bias = False  # do we use bias inside LayerNorm and Linear layers?
 learning_rate = 6e-4  # max learning rate (10x for better Muon dual optimizer alignment)
 # Training duration - can specify either max_iters OR max_epochs (not both)
 # If max_epochs is set, max_iters will be calculated automatically based on dataset size
-max_iters = 100  # Maximum training iterations (set to None to use max_epochs instead)
-max_epochs = None  # Maximum training epochs (set to None to use max_iters instead)
+max_iters = None  # Maximum training iterations (set to None to use max_epochs instead)
+max_epochs = 1  # Maximum training epochs (set to None to use max_iters instead)
 max_tokens = None  # 50_000_000_000 to drive by tokens instead of epochs/iterations
 weight_decay = 1e-1
 beta1 = 0.9

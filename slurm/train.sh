@@ -1,0 +1,14 @@
+#!/bin/bash
+#SBATCH --job-name=pretrain_zero_rl
+#SBATCH --output=logs/%x_%j.log     # %x=job-name, %j=job-id
+#SBATCH --error=logs/%x_%j.err      # Separate error log is often helpful
+#SBATCH --gres=gpu:8
+#SBATCH --cpus-per-task=128
+#SBATCH --mem=256G
+#SBATCH --time=2-00:00:00
+#SBATCH --nodes=1
+
+cd "$SLURM_SUBMIT_DIR" || exit
+
+# run the training script
+bash start.sh "$@"
