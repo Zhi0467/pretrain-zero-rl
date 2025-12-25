@@ -7,8 +7,8 @@
 #SBATCH --mem=256G
 #SBATCH --time=2-00:00:00
 #SBATCH --nodes=1
-#SBATCH --email-user=zhw119@ucsd.edu
-#SBATCH --email-type=END,FAIL
+#SBATCH --mail-user=zhw119@ucsd.edu
+#SBATCH --mail-type=END,FAIL
 
 cd "$SLURM_SUBMIT_DIR" || exit
 
