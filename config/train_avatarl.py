@@ -80,11 +80,11 @@ critic_model_path = 'out/ckpt_wandb_logging_fix.pt' # Path to the pre-trained cr
 use_4bit_critic = False  # Whether to load critic model with 4-bit quantization (saves ~75% memory)
 
 # PoE weights
-reality_weight = 0.2
+reality_weight = 0.5
 mentor_weight = 0.5
 
 # Reality expert settings
-label_smoothing_epsilon = 0.5
+label_smoothing_epsilon = 0.2
 
 # Reward settings
 reward_scale = 100.0  # Scale probabilities to meaningful rewards

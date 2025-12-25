@@ -345,21 +345,8 @@ def compute_avatarl_loss(
     action_probs_sum = masked_action_probs.sum(dim=1, keepdim=True)
     action_probs_normalized = masked_action_probs / (action_probs_sum + 1e-8)
     
-    # Implement mean thresholding: only reward tokens above mean
-    # Calculate mean probability across valid actions
-    valid_action_counts = action_masks.sum(dim=1, keepdim=True).float()
-    mean_prob = action_probs_sum / (valid_action_counts + 1e-8)
-    
-    # Only reward tokens that are above mean (creates sparse rewards)
-    above_mean_mask = (action_probs_normalized > mean_prob) & action_masks
-    action_rewards = torch.where(
-        above_mean_mask,
-        action_probs_normalized * reward_scale,  # Above mean: get scaled reward
-        torch.zeros_like(action_probs_normalized)  # Below mean: get zero
-    )
-    
-    # Apply mask to ensure padded positions stay zero
-    action_rewards = action_rewards * action_masks.float()
+    # Reward all actions proportionally (no above-mean sparsification)
+    action_rewards = action_probs_normalized * reward_scale * action_masks.float()
     
     # CRITICAL: Clamp rewards to max value and rescale others proportionally
     # This prevents gradient explosion while maintaining relative reward differences
@@ -382,6 +369,13 @@ def compute_avatarl_loss(
     valid_action_counts = action_masks.sum(dim=1, keepdim=True).clamp(min=1)
     baseline = action_rewards.sum(dim=1, keepdim=True) / valid_action_counts
     action_advantages = (action_rewards - baseline) * action_masks.float()
+    # Ground-truth token should never receive a negative advantage
+    is_gt_token = (action_indices_padded == ground_truth_flat.unsqueeze(1)) & action_masks
+    action_advantages = torch.where(
+        is_gt_token,
+        torch.clamp(action_advantages, min=0.0),
+        action_advantages,
+    )
     
     # --- Step 4: Calculate Policy Gradient Loss ---
     # Apply temperature scaling for exploration (replaces entropy regularization)
